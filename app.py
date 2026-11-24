@@ -88,17 +88,19 @@ hr {border-color:#edf0f4;}
 """, unsafe_allow_html=True)
 
 CATEGORY_MAP = {
-    "한식":"한식", "닭갈비":"치킨·고기", "삼계탕":"한식", "고기요리":"치킨·고기",
-    "순대, 순댓국":"한식", "순댓국":"한식", "찌개, 전골":"한식", "냉면":"한식",
-    "칼국수":"한식", "감자탕":"한식", "치킨, 닭강정":"치킨·고기",
-    "양식":"양식", "이탈리아음식":"양식", "피자":"양식",
-    "샌드위치":"간편식", "햄버거":"간편식", "핫도그":"간편식",
-    "분식":"분식", "종합분식":"분식", "떡볶이":"분식",
-    "중식":"중식", "마라탕":"중식", "일식":"일식", "돈가스":"일식",
-    "베트남음식":"세계음식", "아시아음식":"세계음식", "인도음식":"세계음식",
-    "멕시코음식":"세계음식", "멕시코, 남미음식":"세계음식",
+    "한식": "한식", "닭갈비": "한식", "삼계탕": "한식", "고기요리": "한식",
+    "순대, 순댓국": "한식", "순댓국": "한식", "찌개, 전골": "한식", "냉면": "한식",
+    "칼국수": "한식", "감자탕": "한식", "치킨, 닭강정": "한식",
+    "양식": "양식", "이탈리아음식": "양식", "피자": "양식",
+    "샌드위치": "패스트푸드/간편식", "햄버거": "패스트푸드/간편식",
+    "핫도그": "패스트푸드/간편식",
+    "분식": "분식", "종합분식": "분식", "떡볶이": "분식",
+    "중식": "중식", "마라탕": "중식",
+    "일식": "일식", "돈가스": "일식",
+    "베트남음식": "세계음식", "아시아음식": "세계음식", "인도음식": "세계음식",
+    "멕시코음식": "세계음식", "멕시코, 남미음식": "세계음식",
 }
-CATEGORY_ORDER = ["한식", "치킨·고기", "분식", "중식", "일식", "양식", "세계음식", "간편식", "기타"]
+CATEGORY_ORDER = ["한식", "양식", "패스트푸드/간편식", "분식", "중식", "일식", "세계음식", "기타"]
 PRIORITIES = {
     "균형 추천": (.30, .25, .25, .20),
     "가성비 우선": (.50, .20, .15, .15),
@@ -155,28 +157,63 @@ def load_restaurants(path: str) -> pd.DataFrame:
 
 
 def recommend(df: pd.DataFrame, budget: int, total_minutes: int, party: int,
-              categories: list[str], priority: str) -> pd.DataFrame:
+              categories: list[str], priority: str, solo_only: bool = False) -> pd.DataFrame:
     result = df.copy()
+
     if categories:
         result = result[result["대분류"].isin(categories)]
-    # 예산 입력은 '1인당 예산'이므로 인원수와 관계없이 1인분 가격으로 비교합니다.
-    # 1인분 가격이 비어 있는 행에 한해서 대표 메뉴 가격을 보조값으로 사용합니다.
+
+    # 혼밥 전용 옵션: 대표 메뉴 가격이 1인분 가격보다 높은 2인 이상 메뉴를 제외합니다.
+    if solo_only:
+        result = result[
+            result["대표메뉴 가격(원)"].notna()
+            & result["대표메뉴 1인분 가격(원)"].notna()
+            & (result["대표메뉴 가격(원)"] <= result["대표메뉴 1인분 가격(원)"])
+        ]
+
+    # 예산은 1인당 기준이며, 1인분 가격이 없을 때 대표 메뉴 가격을 보조값으로 사용합니다.
     per_person = result["대표메뉴 1인분 가격(원)"].fillna(result["대표메뉴 가격(원)"])
     result = result[per_person.notna() & (per_person <= budget)].copy()
     result["_비교가격"] = per_person.loc[result.index]
+
     # 왕복 이동 시간과 식사 시간 22분을 고려합니다.
-    result = result[result["도보 시간(분)"].notna() & (result["도보 시간(분)"] * 2 + 22 <= total_minutes)]
+    result = result[
+        result["도보 시간(분)"].notna()
+        & (result["도보 시간(분)"] * 2 + 22 <= total_minutes)
+    ]
     if result.empty:
         return result
+
     max_dist = max(float(df["도보 거리(m)"].max()), 1)
     max_reviews = max(float(np.log1p(df["리뷰 수"].fillna(0).max())), 1)
-    avg_rating = df["별점"].mean()
+    global_mean_rating = df["별점"].mean()
+    if pd.isna(global_mean_rating):
+        global_mean_rating = 3.5
+
     result["가성비"] = (1 - result["_비교가격"] / max(budget, 1)).clip(0, 1)
-    result["접근성"] = (1 - result["도보 거리(m)"].fillna(max_dist) / max_dist).clip(0, 1)
-    result["인기도"] = (np.log1p(result["리뷰 수"].fillna(0)) / max_reviews).clip(0, 1)
-    result["평점"] = result["별점"].fillna(avg_rating if pd.notna(avg_rating) else 3.5).div(5).clip(0, 1)
+    result["접근성"] = (
+        1 - result["도보 거리(m)"].fillna(max_dist) / max_dist
+    ).clip(0, 1)
+    result["인기도"] = (
+        np.log1p(result["리뷰 수"].fillna(0)) / max_reviews
+    ).clip(0, 1)
+
+    # 베이지안 평점: 리뷰가 적을수록 전체 평균에 가깝게 보정합니다.
+    prior_weight = 300
+    review_count = result["리뷰 수"].fillna(0).clip(lower=0)
+    raw_rating = result["별점"].fillna(global_mean_rating)
+    bayes_rating = (
+        review_count * raw_rating + prior_weight * global_mean_rating
+    ) / (review_count + prior_weight)
+    result["보정별점"] = bayes_rating.round(2)
+    result["평점"] = (bayes_rating / 5.0).clip(0, 1)
+
     weights = PRIORITIES[priority]
-    result["추천점수"] = (100 * sum(w * result[col] for w, col in zip(weights, ["가성비", "접근성", "인기도", "평점"]))).round(1)
+    score_columns = ["가성비", "접근성", "인기도", "평점"]
+    result["추천점수"] = (
+        100 * sum(w * result[col] for w, col in zip(weights, score_columns))
+    ).round(1)
+
     return result.sort_values(["추천점수", "리뷰 수"], ascending=False)
 
 
@@ -265,6 +302,11 @@ with tabs[0]:
         budget = c1.slider("1인당 예산", 3500, 30000, 10000, 500, format="%d원")
         available = c2.slider("사용 가능한 시간", 25, 150, 100, 5, format="%d분")
         party = c3.selectbox("식사 인원", [1, 2, 3, 4], index=0, format_func=lambda x: f"{x}명")
+        solo_only = st.checkbox(
+            "혼밥 가능 식당만 보기",
+            value=False,
+            help="대표 메뉴 가격과 1인분 가격을 비교해 2인 이상 메뉴를 제외합니다."
+        )
         st.markdown("**음식 종류**")
         st.caption("원하는 음식 종류를 선택해 주세요. 여러 개를 선택할 수 있습니다.")
         available_categories = [c for c in CATEGORY_ORDER if c in restaurants["대분류"].unique()]
@@ -278,8 +320,14 @@ with tabs[0]:
         priority = st.radio("추천 기준", list(PRIORITIES), horizontal=True, label_visibility="collapsed")
         submitted = st.form_submit_button("✦  추천받기", type="primary", use_container_width=True)
     if submitted:
-        st.session_state["recommendation_results"] = recommend(restaurants, budget, available, party, selected_categories, priority)
-        st.session_state["recommendation_params"] = {"budget": budget, "available": available, "party": party, "categories": selected_categories, "priority": priority}
+        st.session_state["recommendation_results"] = recommend(
+            restaurants, budget, available, party, selected_categories, priority, solo_only
+        )
+        st.session_state["recommendation_params"] = {
+            "budget": budget, "available": available, "party": party,
+            "categories": selected_categories, "priority": priority,
+            "solo_only": solo_only,
+        }
     results = st.session_state.get("recommendation_results")
     st.markdown('<div class="section-heading">추천 결과</div>', unsafe_allow_html=True)
     if results is None:
@@ -307,10 +355,11 @@ with tabs[0]:
                     st.markdown(f'<div class="card-title">{row["상호"]}</div>', unsafe_allow_html=True)
                     st.write(str(row["대표 메뉴"]))
                     st.markdown(f"**{won(row['_비교가격'])} / 1인**")
-                    rating = "평점 정보 없음" if pd.isna(row["별점"]) else f"★ {row['별점']:.1f}"
+                    raw_rating_text = "원본 평점 정보 없음" if pd.isna(row["별점"]) else f"원본 ★ {row['별점']:.1f}"
+                    rating = f"보정 ★ {row['보정별점']:.2f}"
                     walk = "정보 없음" if pd.isna(row["도보 시간(분)"]) else f"도보 {int(row['도보 시간(분)'])}분"
                     review_count = 0 if pd.isna(row["리뷰 수"]) else int(row["리뷰 수"])
-                    st.caption(f"{rating} · 리뷰 {review_count:,}개 · {walk}")
+                    st.caption(f"{rating} · {raw_rating_text} · 리뷰 {review_count:,}개 · {walk}")
                     rid = row["식당ID"]
                     if st.button("♥ 즐겨찾기 해제" if rid in favorites else "♡ 즐겨찾기 추가",
                                  key=f"homefav_{idx}_{rid}", use_container_width=True):
@@ -327,15 +376,32 @@ with tabs[0]:
             ranked["도보"] = ranked["도보 시간(분)"].map(
                 lambda x: "정보 없음" if pd.isna(x) else f"{int(x)}분"
             )
-            ranked["평점 표시"] = ranked["별점"].map(
-                lambda x: "정보 없음" if pd.isna(x) else f"★ {float(x):.1f}"
+            ranked["평점 표시"] = ranked["보정별점"].map(
+                lambda x: "정보 없음" if pd.isna(x) else f"보정 ★ {float(x):.2f}"
             )
             st.dataframe(
                 ranked[["순위", "상호", "대분류", "대표 메뉴", "1인분 가격", "도보", "평점 표시", "리뷰 수", "추천점수"]],
                 use_container_width=True, hide_index=True
             )
+
         else:
             st.caption(f"조건에 맞는 식당 {len(results)}곳을 찾았습니다. 현재 조건에서는 TOP 15까지 표시할 결과가 없습니다.")
+
+        with st.expander("세부 추천 점수 산출 내역 보기"):
+            detail_df = results[
+                ["상호", "추천점수", "가성비", "접근성", "인기도", "평점", "보정별점", "리뷰 수"]
+            ].copy()
+            for col in ["가성비", "접근성", "인기도", "평점"]:
+                detail_df[col] = (detail_df[col] * 100).round(1)
+            detail_df = detail_df.rename(columns={
+                "가성비": "가성비 점수(%)",
+                "접근성": "접근성 점수(%)",
+                "인기도": "인기도 점수(%)",
+                "평점": "보정 평점 점수(%)",
+                "보정별점": "베이지안 보정 별점",
+            })
+            st.caption("각 항목은 0~100점으로 환산한 값이며, 최종 추천점수에는 선택한 추천 기준의 가중치가 적용됩니다.")
+            st.dataframe(detail_df, use_container_width=True, hide_index=True)
 
 
 # FAVORITES: map first, saved restaurants below
@@ -380,7 +446,7 @@ with tabs[2]:
         name = st.text_input("식당 이름 *")
         address = st.text_input("주소 *")
         menu = st.text_input("대표 메뉴")
-        category = st.selectbox("음식 종류", ["한식", "분식", "중식", "일식", "양식", "치킨·고기", "간편식", "세계음식", "기타"])
+        category = st.selectbox("음식 종류", ["한식", "양식", "패스트푸드/간편식", "분식", "중식", "일식", "세계음식", "기타"])
         price = st.number_input("1인분 가격", min_value=0, max_value=100000, value=10000, step=500)
         submitted_restaurant = st.form_submit_button("식당 등록", type="primary")
         if submitted_restaurant:
