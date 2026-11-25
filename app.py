@@ -300,7 +300,7 @@ with tabs[0]:
     with st.form("recommend_form"):
         c1, c2, c3 = st.columns(3)
         budget = c1.slider("1인당 예산", 3500, 30000, 10000, 500, format="%d원")
-        available = c2.slider("왕복 이동 시간", 25, 150, 100, 5, format="%d분")
+        available = c2.slider("왕복 이동 시간", 1, 20, 10, 1, format="%d분")
         party = c3.selectbox("식사 인원", [1, 2, 3, 4], index=0, format_func=lambda x: f"{x}명")
         solo_only = st.checkbox(
             "혼밥 가능 식당만 보기",
